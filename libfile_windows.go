@@ -1,14 +1,59 @@
 package catlib
 
 import (
+	"bufio"
 	"debug/pe"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
+
+type IMAGE_ARCHIVE_MEMBER_HEADER struct {
+	RawName      [16]byte // 0
+	RawDate      [12]byte // 16
+	RawUserID    [6]byte  // 28
+	RawGroupID   [6]byte  // 34
+	RawMode      [8]byte  // 40
+	RawSize      [10]byte // 48
+	RawEndHeader [2]byte  // 58
+}
+
+type MemberHeader struct {
+	ShortName  string
+	Date       int
+	UserID     int
+	GroupID    int
+	Mode       int
+	Size       int
+	LongName   string
+	fileOffset int64
+	symbols    []Symbol
+}
+
+type LibFile struct {
+	ILibFile
+	firstHeader      *MemberHeader
+	secondHeader     *MemberHeader
+	secondLinkMember tagSecondLinkerMember
+	longNameHeader   *MemberHeader
+	Members          []*MemberHeader
+	filePath         string
+}
+
+type tagSecondLinkerMember struct {
+	NumberOfMembers uint32
+	Offsets         []uint32
+	NumberOfSymbols uint32
+	Indices         []uint16
+	StringTable     []string
+}
 
 const (
 	IMAGE_SYM_CLASS_END_OF_FUNCTION  = 0x00ff
@@ -41,47 +86,18 @@ const (
 	IMAGE_SYM_CLASS_CLR_TOKEN        = 0x006B
 )
 
-type IMAGE_ARCHIVE_MEMBER_HEADER struct {
-	RawName      [16]byte // 0
-	RawDate      [12]byte // 16
-	RawUserID    [6]byte  // 28
-	RawGroupID   [6]byte  // 34
-	RawMode      [8]byte  // 40
-	RawSize      [10]byte // 48
-	RawEndHeader [2]byte  // 58
-}
+var (
+	lib = ""
+)
 
-type MemberHeader struct {
-	ShortName  string
-	Date       int
-	UserID     int
-	GroupID    int
-	Mode       int
-	Size       int
-	LongName   string
-	fileOffset int64
-	symbols    []*pe.Symbol
-}
+func init() {
+	_, vscomntools := findVSComnTools()
+	if vscomntools == "" {
+		return
+	}
+	binDir := filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(vscomntools))), "VC", "bin")
 
-type Lib struct {
-	firstHeader      *MemberHeader
-	secondHeader     *MemberHeader
-	secondLinkMember tagSecondLinkerMember
-	longNameHeader   *MemberHeader
-	Members          []*MemberHeader
-	filePath         string
-}
-
-type tagSecondLinkerMember struct {
-	NumberOfMembers uint32
-	Offsets         []uint32
-	NumberOfSymbols uint32
-	Indices         []uint16
-	StringTable     []string
-}
-
-func (lib *Lib) Symbols(memberIndex int) []*pe.Symbol {
-	return lib.Members[memberIndex].symbols
+	lib = filepath.Join(binDir, "lib.exe")
 }
 
 func isImportSymbol(symbol *pe.Symbol) bool {
@@ -92,26 +108,21 @@ func isExportSymbol(symbol *pe.Symbol) bool {
 	return symbol.StorageClass == IMAGE_SYM_CLASS_EXTERNAL && (symbol.Value != 0 || symbol.SectionNumber != 0)
 }
 
-func (lib *Lib) ImportSymbols(memberIndex int) []*pe.Symbol {
-	ret := []*pe.Symbol{}
+func (lib *LibFile) ImportSymbols(memberIndex int) []Symbol {
+	ret := []Symbol{}
 	for _, sym := range lib.Members[memberIndex].symbols {
-		if isImportSymbol(sym) {
+		if sym.IsImportSymbol() {
 			ret = append(ret, sym)
 		}
 	}
 
 	// exclude symbols, which are resolved by the lib itself.
-	result := []*pe.Symbol{}
+	result := []Symbol{}
 	for _, sym := range ret {
 		exported := false
-		for _, m := range lib.Members {
-			for _, s := range m.symbols {
-				if sym.Name == s.Name && isExportSymbol(s) {
-					exported = true
-					break
-				}
-			}
-			if exported {
+		for _, s := range lib.Members[memberIndex].symbols {
+			if sym.Name() == s.Name() && s.IsExportSymbol() {
+				exported = true
 				break
 			}
 		}
@@ -122,14 +133,18 @@ func (lib *Lib) ImportSymbols(memberIndex int) []*pe.Symbol {
 	return result
 }
 
-func (lib *Lib) ExportSymbols(memberIndex int) []*pe.Symbol {
-	ret := []*pe.Symbol{}
+func (lib *LibFile) ExportSymbols(memberIndex int) []Symbol {
+	ret := []Symbol{}
 	for _, sym := range lib.Members[memberIndex].symbols {
-		if isExportSymbol(sym) {
+		if sym.IsExportSymbol() {
 			ret = append(ret, sym)
 		}
 	}
 	return ret
+}
+
+func (this *LibFile) NumMembers() int {
+	return len(this.Members)
 }
 
 func (h IMAGE_ARCHIVE_MEMBER_HEADER) name() string {
@@ -246,49 +261,48 @@ func newSecondLinkerMember(r io.Reader) (tagSecondLinkerMember, error) {
 	return m, nil
 }
 
-func NewLib(filePath string) (lib *Lib, err error) {
-	lib = new(Lib)
+func (lib *LibFile) Open(filePath string, arch string) error {
 	lib.filePath = filePath
 	r, err := os.Open(filePath)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer r.Close()
 
 	magicBytes := make([]byte, 8)
 	n, e := r.Read(magicBytes)
 	if n != len(magicBytes) || e != nil {
-		return nil, e
+		return e
 	}
 	magic := string(magicBytes[:])
 	expectedMagic := "!<arch>\n"
 	if magic != expectedMagic {
-		return nil, fmt.Errorf("invalid magic header: \"%s\" should be \"%s\"", magic, expectedMagic)
+		return fmt.Errorf("invalid magic header: \"%s\" should be \"%s\"", magic, expectedMagic)
 	}
 
 	lib.firstHeader, err = newImageArchiveMemberHeader(r)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// skip first archive member header, and seek to second archive member header.
 	var pos int64
 	pos, err = r.Seek(int64(lib.firstHeader.Size), io.SeekCurrent)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// IMAGE_ARCHIVE_MEMBER_HEADER should have been placed 2byte padding.
 	if pos%2 == 1 {
 		pos, err = r.Seek(1, io.SeekCurrent)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
 	lib.secondHeader, err = newImageArchiveMemberHeader(r)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// read second archive member header.
@@ -306,25 +320,25 @@ func NewLib(filePath string) (lib *Lib, err error) {
 		buffer = make([]byte, lib.longNameHeader.Size)
 		_, err = r.Read(buffer)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
 	for i := 0; i < int(lib.secondLinkMember.NumberOfMembers); i++ {
 		_, err := r.Seek(int64(lib.secondLinkMember.Offsets[i]), io.SeekStart)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		m, e := newImageArchiveMemberHeader(r)
 		if e != nil {
-			return nil, e
+			return e
 		}
 		m.fileOffset, _ = r.Seek(0, io.SeekCurrent)
 		if strings.HasPrefix(m.ShortName, "/") {
 			offsetStr := strings.TrimRight(m.ShortName[1:], " ")
 			offset, err := strconv.Atoi(offsetStr)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			m.LongName = stringPart(offset, &buffer)
 		}
@@ -335,13 +349,16 @@ func NewLib(filePath string) (lib *Lib, err error) {
 			continue
 		}
 		for _, sym := range obj.Symbols {
-			m.symbols = append(m.symbols, sym)
+			m.symbols = append(m.symbols, NewSymbol(sym))
 		}
 
 		lib.Members = append(lib.Members, m)
 	}
 
-	return lib, nil
+	return nil
+}
+
+func (this *LibFile) Close() {
 }
 
 func stringPart(offset int, buffer *[]byte) string {
@@ -361,7 +378,7 @@ func (m *MemberHeader) Name() string {
 	return strings.TrimRight(strings.TrimRight(m.ShortName, " "), "/")
 }
 
-func (lib *Lib) Extract(memberIndex int, w io.Writer) error {
+func (lib *LibFile) Extract(memberIndex int, w io.Writer) error {
 	file, err := os.Open(lib.filePath)
 	if err != nil {
 		return err
@@ -379,5 +396,73 @@ func (lib *Lib) Extract(memberIndex int, w io.Writer) error {
 		return fmt.Errorf("Written file size mismatch expected %d for %d", m.Size, n)
 	}
 
+	return nil
+}
+
+func findVSComnTools() (name, value string) {
+	reg := regexp.MustCompile(`^VS([0-9]*)COMNTOOLS$`)
+	comtools := make(map[int]string)
+	for _, e := range os.Environ() {
+		tokens := strings.Split(e, "=")
+		if len(tokens) != 2 {
+			continue
+		}
+		key := tokens[0]
+		result := reg.FindSubmatch([]byte(key))
+		if len(result) == 0 {
+			continue
+		}
+		version, err := strconv.Atoi(string(result[1]))
+		if err != nil {
+			continue
+		}
+		if version <= 0 {
+			continue
+		}
+		value := tokens[1]
+		comtools[version] = value
+	}
+
+	maxVersion := -1
+	for version := range comtools {
+		if maxVersion < version {
+			maxVersion = version
+		}
+	}
+
+	if maxVersion == -1 {
+		return "", ""
+	}
+	return fmt.Sprintf("VS%dCOMNTOOLS", maxVersion), comtools[maxVersion]
+}
+
+func Concat(files []string, output, workingDirectory, arch string, libflags string) error {
+	fp, err := ioutil.TempFile(os.TempDir(), "concatlib_")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(fp.Name())
+
+	fmt.Fprintf(fp, "%s\n", libflags)
+	for _, file := range files {
+		fmt.Fprintf(fp, "\"%s\"\n", file)
+	}
+	fmt.Fprintf(fp, "/OUT:\"%s\"\n", output)
+	fp.Close()
+
+	c := exec.Command(lib, fmt.Sprintf("@%s", fp.Name()), "/NOLOGO")
+	c.Dir = workingDirectory
+	stdout, err := StdoutPipe(c)
+	c.Start()
+
+	s := bufio.NewScanner(stdout)
+	for s.Scan() {
+		fmt.Printf("%s\n", s.Text())
+	}
+	err = c.Wait()
+
+	if err != nil {
+		return fmt.Errorf("Err: %v, Args: %v", err, c.Args)
+	}
 	return nil
 }
